@@ -16,11 +16,19 @@ import type { SyncJob, SyncRunRecord, SyncStatus, SyncStore } from "./sync-runne
 const UNIQUE_VIOLATION = "23505";
 
 /**
- * How long a run may sit in `running` before another worker may take it over. A worker that
- * crashes mid-run leaves its row in `running` forever; without a timeout that job key could
- * never be synced again. Set well above the longest expected backfill.
+ * How long a run may go without progress before another worker may take it over.
+ *
+ * A worker killed mid-run leaves its row in `running` for ever; without a timeout that job key
+ * could never be synced again. This used to be six hours, on the reasoning that the window had
+ * to exceed the longest imaginable backfill. That reasoning had a cost nobody had priced: six
+ * hours after the 03:00 cron is 09:00, and the cron does not fire again until 03:00, so a
+ * single timeout put the job beyond reach until the following night.
+ *
+ * Measuring from the heartbeat instead of from the start removes the trade-off. A backfill
+ * that is genuinely working moves its own deadline after every page, so it cannot be stolen
+ * however long it runs, while one that has stopped is reclaimable within the same night.
  */
-const STALE_RUN_MS = 6 * 60 * 60 * 1000;
+const STALE_RUN_MS = 15 * 60 * 1000;
 
 interface SyncRunRow {
   id: string;
@@ -32,10 +40,11 @@ interface SyncRunRow {
   error_code: string | null;
   error_message: string | null;
   started_at: string | null;
+  heartbeat_at: string | null;
 }
 
 const RUN_COLUMNS =
-  "id, job_key, status, attempt_count, records_received, records_written, error_code, error_message, started_at";
+  "id, job_key, status, attempt_count, records_received, records_written, error_code, error_message, started_at, heartbeat_at";
 
 function toRecord(row: SyncRunRow): SyncRunRecord {
   return {
@@ -50,9 +59,16 @@ function toRecord(row: SyncRunRow): SyncRunRecord {
   };
 }
 
-function isStale(startedAt: string | null, now: number): boolean {
-  if (startedAt === null) return false;
-  return now - Date.parse(startedAt) > STALE_RUN_MS;
+/**
+ * Whether a run has gone quiet long enough to be taken over.
+ *
+ * The heartbeat is the measure; `started_at` is the fallback for a run that was killed before
+ * writing its first page, and for rows created before the heartbeat column existed.
+ */
+function isStale(row: Pick<SyncRunRow, "started_at" | "heartbeat_at">, now: number): boolean {
+  const lastSeen = row.heartbeat_at ?? row.started_at;
+  if (lastSeen === null) return false;
+  return now - Date.parse(lastSeen) > STALE_RUN_MS;
 }
 
 export function createSupabaseSyncStore(client: SupabaseClient): SyncStore {
@@ -99,7 +115,7 @@ export function createSupabaseSyncStore(client: SupabaseClient): SyncStore {
       const reclaimable =
         row.status === "failed" ||
         row.status === "cancelled" ||
-        isStale(row.started_at, Date.now());
+        isStale(row, Date.now());
       if (!reclaimable) return null;
 
       // Compare-and-set on attempt_count. If another worker claimed this row between the
@@ -111,6 +127,7 @@ export function createSupabaseSyncStore(client: SupabaseClient): SyncStore {
           status: "queued" satisfies SyncStatus,
           attempt_count: row.attempt_count + 1,
           started_at: null,
+          heartbeat_at: null,
           completed_at: null,
           error_code: null,
           error_message: null,
@@ -125,9 +142,18 @@ export function createSupabaseSyncStore(client: SupabaseClient): SyncStore {
     },
 
     async markRunning(runId: string): Promise<void> {
+      const now = new Date().toISOString();
       const { error } = await client
         .from("sync_runs")
-        .update({ status: "running" satisfies SyncStatus, started_at: new Date().toISOString() })
+        .update({ status: "running" satisfies SyncStatus, started_at: now, heartbeat_at: now })
+        .eq("id", runId);
+      if (error) throw error;
+    },
+
+    async heartbeat(runId: string): Promise<void> {
+      const { error } = await client
+        .from("sync_runs")
+        .update({ heartbeat_at: new Date().toISOString() })
         .eq("id", runId);
       if (error) throw error;
     },

@@ -49,6 +49,8 @@ The list below is the template.
 | `ORGANISATION_ID` | Printed by `node scripts/seed-organisation.mjs`. Every table is keyed on it. |
 | `TOKEN_ENCRYPTION_KEY` | Generate 32 random bytes, base64. Encrypts provider tokens at rest — if lost, every stored token must be reconnected. |
 | `CRON_SECRET` | Generate 32 random bytes. Bearer token for `/api/cron/daily`. |
+| `VERCEL_AUTOMATION_BYPASS_SECRET` | Optional. Vercel → Deployment Protection → Protection Bypass for Automation. Only needed when protection is on, so the refresh can call its own next step. |
+| `PIPELINE_STEP_BUDGET_MS` | Optional, default 45000. How long one invocation takes steps before handing over. Keep it under the plan's function limit. |
 | `SHOPIFY_SHOP_DOMAIN` | The `myshopify.com` host, no scheme and no trailing slash. |
 | `SHOPIFY_ADMIN_TOKEN` | Admin API access token, begins `shpat_`. Not the `shpss_` secret key, and shown only once. |
 
@@ -185,7 +187,10 @@ Supabase is already hosted, so only the Next.js application needs deploying.
    default `npm install` fails on the current peer tree.
 3. Add every variable from the table above as an **Environment Variable**, for Production.
    `SUPABASE_DB_URL` is not needed — it is only used by the local migration scripts.
-4. Deploy. The cron in `vercel.json` runs `/api/cron/daily` at 03:00 UTC and Vercel supplies
+4. If Deployment Protection is on, generate a Protection Bypass for Automation secret and add
+   it as `VERCEL_AUTOMATION_BYPASS_SECRET`. Without it the refresh completes only its first
+   step — see **Scheduled refresh** below.
+5. Deploy. The cron in `vercel.json` runs `/api/cron/daily` at 03:00 UTC and Vercel supplies
    the `CRON_SECRET` bearer token automatically.
 
 Nothing needs to change in Supabase: the deployment connects to the same project the local
@@ -212,13 +217,43 @@ email.
 Cron is configured in `vercel.json` for 03:00 daily and supplies that header automatically.
 
 It **fetches from every connected provider and then recalculates** — Shopify catalogue and
-orders, Meta hierarchy and insights, then the contribution walk. The same pipeline is behind
-the **Refresh now** button on the data-quality page, so a manual refresh and the nightly one
-cannot drift apart.
+orders, Meta hierarchy and insights, then the contribution walk. The same steps are behind the
+**Refresh now** button on the data-quality page, so a manual refresh and the nightly one cannot
+drift apart.
 
 Providers run in sequence and one failing does not stop the others: Meta being down must not
 prevent Shopify orders importing. A run where any provider failed reports `partial`, never
 `ok`, and the per-provider outcome is shown rather than collapsed into a single tick.
+
+### It runs as steps, across several invocations
+
+A serverless function has a wall-clock budget, and exceeding it kills the process outright — no
+catch block runs, nothing is recorded. So the refresh is not one call. It is an ordered list of
+steps stored in `pipeline_runs`, and the route takes as many as fit in `PIPELINE_STEP_BUDGET_MS`
+before asking itself to continue. Each hand-over is a new invocation with a new budget.
+
+That matters because of what the old behaviour cost. A killed run left `sync_runs` holding a row
+in `running` that nothing would complete, and the staleness window was six hours — longer than
+the gap to the next nightly cron. **One timeout silently cost a full day of data.** Now a killed
+step is retried within the same run, and a step that repeatedly fails to complete is given up on
+after three attempts so the steps after it, including the publish, still run.
+
+The endpoint returns `202` as soon as it has claimed the run, before the work starts. Vercel's
+cron log will therefore always show success; the run's real outcome is in `pipeline_runs` and on
+the **Last refresh** panel of the data-quality page.
+
+Two things follow for deployment:
+
+- Set `VERCEL_AUTOMATION_BYPASS_SECRET` if Deployment Protection is on. Vercel exempts its own
+  cron invocations from protection but **not** a request the deployment makes to itself, so
+  without it the second hop is answered with the authentication page and the run stops after one
+  step. Vercel → Project → Settings → Deployment Protection → Protection Bypass for Automation.
+- Keep `PIPELINE_STEP_BUDGET_MS` comfortably under the plan's function limit. A step that starts
+  inside the budget still has to finish, so the default of 45s suits a 60s limit.
+
+The publish is sliced into 15-day chunks, oldest first. If a run is cut short the unpublished
+days are the most recent ones, which reads as a coverage gap rather than a hole in the middle of
+the period.
 
 It republishes a trailing 45-day window rather than only yesterday: a refund processed today
 lands on today, but an order edited in Shopify changes a past day, and a restated cost changes

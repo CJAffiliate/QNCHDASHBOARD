@@ -83,6 +83,7 @@ describe("createSupabaseSyncStore.claimRun", () => {
           job_key: job.jobKey,
           status: "running",
           started_at: new Date(Date.now() - HOUR_MS).toISOString(),
+          heartbeat_at: new Date().toISOString(),
         },
       ],
     });
@@ -90,9 +91,30 @@ describe("createSupabaseSyncStore.claimRun", () => {
     expect(await createSupabaseSyncStore(client).claimRun(job)).toBeNull();
   });
 
-  it("reclaims a run abandoned by a crashed worker", async () => {
+  it("does not steal a long backfill that is still reporting progress", async () => {
+    // The point of heartbeating. Staleness is measured from the last page written, not from
+    // when the job started, so a genuinely slow import keeps its job key however long it runs
+    // — which is what allows the staleness window to be short enough to retry the same night.
+    const { client } = createFakeClient({
+      sync_runs: [
+        {
+          ...DEFAULTS.sync_runs,
+          id: "run-1",
+          job_key: job.jobKey,
+          status: "running",
+          started_at: new Date(Date.now() - 12 * HOUR_MS).toISOString(),
+          heartbeat_at: new Date(Date.now() - 60_000).toISOString(),
+        },
+      ],
+    });
+
+    expect(await createSupabaseSyncStore(client).claimRun(job)).toBeNull();
+  });
+
+  it("reclaims a run whose worker stopped reporting progress", async () => {
     // Without this, a worker that dies mid-run leaves its row in `running` forever and that
-    // job key could never be synced again.
+    // job key could never be synced again. Twenty minutes is past the staleness window, so
+    // this run is reclaimed the same night rather than the next.
     const { client } = createFakeClient({
       sync_runs: [
         {
@@ -101,7 +123,8 @@ describe("createSupabaseSyncStore.claimRun", () => {
           job_key: job.jobKey,
           status: "running",
           attempt_count: 1,
-          started_at: new Date(Date.now() - 12 * HOUR_MS).toISOString(),
+          started_at: new Date(Date.now() - HOUR_MS).toISOString(),
+          heartbeat_at: new Date(Date.now() - 20 * 60_000).toISOString(),
         },
       ],
     });
@@ -110,6 +133,27 @@ describe("createSupabaseSyncStore.claimRun", () => {
 
     expect(run).not.toBeNull();
     expect(run?.attemptCount).toBe(2);
+  });
+
+  it("reclaims a run killed before it wrote its first page", async () => {
+    // A run killed between `markRunning` and its first page has no heartbeat to judge it by.
+    // Falling back to `started_at` is what stops that job key being held for ever, and it is
+    // also how rows created before the heartbeat column existed are still reclaimable.
+    const { client } = createFakeClient({
+      sync_runs: [
+        {
+          ...DEFAULTS.sync_runs,
+          id: "run-1",
+          job_key: job.jobKey,
+          status: "running",
+          attempt_count: 1,
+          started_at: new Date(Date.now() - HOUR_MS).toISOString(),
+          heartbeat_at: null,
+        },
+      ],
+    });
+
+    expect(await createSupabaseSyncStore(client).claimRun(job)).not.toBeNull();
   });
 
   it("lets only one worker win when two race to reclaim the same failed run", async () => {

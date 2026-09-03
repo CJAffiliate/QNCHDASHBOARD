@@ -162,6 +162,7 @@ function createStore(overrides: Partial<SyncStore> = {}) {
     cursors: new Map<string, { cursor: string | null; watermarkAt: string | null }>(),
     succeededKeys: new Set<string>(),
     connectionAttempts: [] as boolean[],
+    heartbeats: [] as string[],
   };
 
   const store: SyncStore = {
@@ -181,6 +182,9 @@ function createStore(overrides: Partial<SyncStore> = {}) {
     markRunning: async (runId) => {
       const run = state.runs.find((candidate) => candidate.id === runId);
       if (run) run.status = "running";
+    },
+    heartbeat: async (runId) => {
+      state.heartbeats.push(runId);
     },
     completeRun: async (runId, totals) => {
       const run = state.runs.find((candidate) => candidate.id === runId);

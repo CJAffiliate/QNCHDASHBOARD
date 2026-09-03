@@ -54,6 +54,15 @@ export interface SyncStore {
    */
   claimRun: (job: SyncJob<unknown>) => Promise<SyncRunRecord | null>;
   markRunning: (runId: string) => Promise<void>;
+  /**
+   * Says the run is still alive, after each page is durably written.
+   *
+   * Staleness has to be measured from something a working job can move, otherwise the window
+   * before another worker may reclaim a job key must be longer than the longest imaginable
+   * backfill — which is what previously let a killed run hold its key for six hours, past the
+   * point where retrying the same night was possible.
+   */
+  heartbeat: (runId: string) => Promise<void>;
   completeRun: (runId: string, totals: { received: number; written: number }) => Promise<void>;
   failRun: (runId: string, error: { code: string; message: string }) => Promise<void>;
   getCursor: (connectionId: string, resourceName: string) => Promise<string | null>;
@@ -101,6 +110,10 @@ export async function runSync<T>(job: SyncJob<T>, store: SyncStore): Promise<Syn
       // The cursor is advanced after each page is durably written, so an interrupted run
       // resumes from the last completed page instead of restarting or skipping records.
       await store.setCursor(job.connectionId, job.resourceName, cursor, watermarkAt);
+
+      // Paired with the cursor write: this run has demonstrably made progress, so it is not
+      // abandoned and its job key must not be taken from it.
+      await store.heartbeat(run.id);
 
       if (pages >= maxPages && cursor !== null) {
         throw new Error(`${job.resourceName} exceeded ${maxPages} pages without completing`);

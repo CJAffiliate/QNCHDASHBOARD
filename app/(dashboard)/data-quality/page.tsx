@@ -13,12 +13,33 @@ import {
 } from "@/lib/monitoring/data-quality";
 import { toBusinessDate } from "@/lib/financial/dates";
 import { relativeTime } from "@/lib/reporting/format";
+import { isRunnable, type PipelineRunStatus } from "@/lib/connectors/pipeline-store";
+import type { PipelineStep } from "@/lib/connectors/pipeline";
 import { StatusPill } from "../../components/metric";
 import { RefreshButton } from "../../components/refresh-button";
 
 export const dynamic = "force-dynamic";
 
 const MAXIMUM_SYNC_AGE_HOURS = 36;
+
+/**
+ * A run still in progress is amber, not green: it has not yet proved it will finish. `partial`
+ * is amber for the opposite reason — it did finish, but a provider did not deliver.
+ */
+const RUN_SEVERITY: Record<PipelineRunStatus, "green" | "amber" | "red"> = {
+  running: "amber",
+  succeeded: "green",
+  partial: "amber",
+  failed: "red",
+};
+
+/** A step left pending on a finished run was given up on, which is a failure, not a wait. */
+const STEP_SEVERITY: Record<PipelineStep["status"], "green" | "amber" | "red"> = {
+  pending: "amber",
+  succeeded: "green",
+  skipped: "green",
+  failed: "red",
+};
 const ALL_PROVIDERS: IntegrationProvider[] = ["shopify", "meta", "tiktok", "xero"];
 
 /**
@@ -37,8 +58,15 @@ export default async function DataQualityPage() {
     businessTimezone: session.businessTimezone,
   });
 
-  const [{ data: connections }, { data: settings }, { data: published }, { data: adAccounts }, policy, context] =
-    await Promise.all([
+  const [
+    { data: connections },
+    { data: settings },
+    { data: published },
+    { data: adAccounts },
+    { data: runs },
+    policy,
+    context,
+  ] = await Promise.all([
       session.client
         .from("integration_connections")
         .select("provider, status, last_success_at, last_attempt_at")
@@ -59,6 +87,12 @@ export default async function DataQualityPage() {
         .from("ad_accounts")
         .select("platform, external_id, timezone")
         .eq("organisation_id", session.organisationId),
+      session.client
+        .from("pipeline_runs")
+        .select("run_key, trigger, status, steps, started_at, heartbeat_at, finished_at")
+        .eq("organisation_id", session.organisationId)
+        .order("started_at", { ascending: false })
+        .limit(1),
       repository.loadPolicy(),
       repository.loadAllocationContext(),
     ]);
@@ -100,6 +134,8 @@ export default async function DataQualityPage() {
 
   const summary = summariseDataQuality(results);
   const latestPublished = published?.[0];
+  const latestRun = runs?.[0];
+  const runSteps = (latestRun?.steps as PipelineStep[] | undefined) ?? [];
 
   return (
     <>
@@ -168,6 +204,88 @@ export default async function DataQualityPage() {
             })}
           </tbody>
         </table>
+      </section>
+
+      <section className="panel">
+        <h2>Last refresh</h2>
+        <p className="muted small" style={{ marginTop: "-0.5rem", marginBottom: "1.25rem" }}>
+          The refresh runs as a sequence of steps across several invocations, so a step killed
+          part-way through is retried rather than costing the night. A step still marked pending
+          on a finished run is one that was given up on after repeated attempts — its provider did
+          not import, and everything after it still did.
+        </p>
+        {latestRun ? (
+          <>
+            <table>
+              <tbody>
+                <tr>
+                  <td>Run</td>
+                  <td>
+                    {latestRun.run_key as string} ({latestRun.trigger as string})
+                  </td>
+                </tr>
+                <tr>
+                  <td>Status</td>
+                  <td>
+                    <StatusPill status={RUN_SEVERITY[latestRun.status as PipelineRunStatus]} />{" "}
+                    {latestRun.status as string}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Started</td>
+                  <td>{relativeTime(latestRun.started_at as string)}</td>
+                </tr>
+                <tr>
+                  <td>{latestRun.finished_at ? "Finished" : "Last progress"}</td>
+                  <td>
+                    {relativeTime(
+                      ((latestRun.finished_at ?? latestRun.heartbeat_at) as string | null) ?? null,
+                    )}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Steps</td>
+                  <td>
+                    {runSteps.filter((step) => step.status === "succeeded").length} of {runSteps.length}{" "}
+                    succeeded
+                    {runSteps.some(isRunnable)
+                      ? `, ${runSteps.filter(isRunnable).length} still to run`
+                      : ""}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <table style={{ marginTop: "1.25rem" }}>
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Status</th>
+                  <th>Attempts</th>
+                  <th>Rows</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {runSteps.map((step) => (
+                  <tr key={step.key}>
+                    <td>
+                      {step.provider} {step.resource}
+                      {step.range ? ` ${step.range.from} to ${step.range.to}` : ""}
+                    </td>
+                    <td>
+                      <StatusPill status={STEP_SEVERITY[step.status]} /> {step.status}
+                    </td>
+                    <td className="tabular">{step.attempts}</td>
+                    <td className="tabular">{step.status === "succeeded" ? step.written : "—"}</td>
+                    <td className="muted small">{step.error ?? ""}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        ) : (
+          <p className="muted">No refresh has been recorded yet.</p>
+        )}
       </section>
 
       <section className="panel">
